@@ -46,18 +46,15 @@ import { AuditLogActionType, createAuditLogEntry } from "@snailycad/audit-logger
 import { isFeatureEnabled } from "lib/upsert-cad";
 import { _leoProperties, assignedUnitsInclude, callInclude } from "utils/leo/includes";
 import { slateDataToString, type Descendant } from "@snailycad/utils/editor";
-import { TeamSpeak } from "teamspeak-client";
+import { TeamSpeak } from "ts3-nodejs-library";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-// ======================== Services ========================
-
 class TeamSpeakService {
-  private client: TeamSpeak;
+  private client: TeamSpeak | null = null;
   private isConnected = false;
-
-  constructor() {
-    this.client = new TeamSpeak();
-  }
+  private reconnectAttempts = 0;
+  private readonly maxReconnectAttempts = 3;
+  private readonly reconnectDelay = 5000; // 5 seconds
 
   async connect(config: {
     host: string;
@@ -67,30 +64,93 @@ class TeamSpeakService {
     nickname: string;
   }) {
     try {
-      await this.client.connect(config);
+      this.client = new TeamSpeak({
+        host: config.host,
+        queryport: config.queryport,
+        serverport: 9987,
+        username: config.username,
+        password: config.password,
+        nickname: config.nickname,
+        readyTimeout: 10000,
+        keepAlive: true
+      });
+
+      this.setupEventHandlers();
+      await this.client.connect();
       this.isConnected = true;
-      console.log("TeamSpeak connected successfully");
+      this.reconnectAttempts = 0;
+      console.log("✅ TeamSpeak connected successfully");
     } catch (error) {
-      console.error("TeamSpeak connection failed:", error);
-      throw error;
+      console.error("❌ TeamSpeak connection failed:", error);
+      await this.handleReconnection(config);
     }
   }
 
-  async sendMessageToChannel(channelId: string, message: string) {
-    if (!this.isConnected) {
-      console.warn("TeamSpeak not connected, message not sent");
-      return;
+  private setupEventHandlers() {
+    if (!this.client) return;
+
+    this.client.on("close", async () => {
+      this.isConnected = false;
+      console.log("🔌 TeamSpeak connection closed");
+    });
+
+    this.client.on("error", (error) => {
+      console.error("⚠️ TeamSpeak error:", error);
+    });
+
+    this.client.on("ready", () => {
+      this.isConnected = true;
+      console.log("✅ TeamSpeak connection ready");
+    });
+  }
+
+  private async handleReconnection(config: {
+    host: string;
+    queryport: number;
+    username: string;
+    password: string;
+    nickname: string;
+  }) {
+    if (this.reconnectAttempts < this.maxReconnectAttempts) {
+      this.reconnectAttempts++;
+      console.log(`♻️ Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+      await new Promise(resolve => setTimeout(resolve, this.reconnectDelay));
+      await this.connect(config);
+    } else {
+      console.error("🛑 Max reconnection attempts reached");
+    }
+  }
+
+  async sendMessageToChannel(channelId: string, message: string): Promise<boolean> {
+    if (!this.client || !this.isConnected) {
+      console.warn("⚠️ TeamSpeak not connected");
+      return false;
     }
 
     try {
-      await this.client.send("sendtextmessage", {
-        targetmode: 2,
-        target: channelId,
-        msg: message,
-      });
-      console.log("TeamSpeak notification sent");
+      const channelIdNum = Number(channelId);
+      if (isNaN(channelIdNum)) {
+        throw new Error(`Invalid channel ID: ${channelId}`);
+      }
+
+      await this.client.sendText(channelIdNum, 1, message);
+      console.log(`💬 Sent message to channel ${channelId}`);
+      return true;
     } catch (error) {
-      console.error("Failed to send TeamSpeak message:", error);
+      console.error("❌ Failed to send TeamSpeak message:", error);
+      return false;
+    }
+  }
+
+  async disconnect() {
+    if (this.client && this.isConnected) {
+      try {
+        await this.client.quit();
+        this.isConnected = false;
+        console.log("🔌 TeamSpeak disconnected");
+      } catch (error) {
+        console.error("⚠️ Error disconnecting from TeamSpeak:", error);
+      }
     }
   }
 }
@@ -120,15 +180,20 @@ class GeminiAIService {
       const result = await this.model.generateContent(prompt);
       const response = await result.response;
       const text = response.text();
-      return JSON.parse(text.trim());
+      const parsed = JSON.parse(text.trim());
+      
+      // Validate response
+      if (typeof parsed.priority !== 'number' || typeof parsed.reasoning !== 'string') {
+        throw new Error("Invalid response format from Gemini AI");
+      }
+      
+      return parsed;
     } catch (error) {
-      console.error("Gemini AI error:", error);
+      console.error("❌ Gemini AI error:", error);
       return { priority: 3, reasoning: "Default priority - analysis failed" };
     }
   }
 }
-
-// ======================== Controller ========================
 
 @Controller("/911-calls")
 @UseBeforeEach(IsAuth)
@@ -144,22 +209,26 @@ export class Calls911Controller {
     this.teamSpeak = new TeamSpeakService();
     this.gemini = new GeminiAIService();
     
-    this.initializeServices().catch(console.error);
+    this.initializeServices().catch((error) => {
+      console.error("❌ Failed to initialize services:", error);
+    });
   }
 
   private async initializeServices() {
     if (process.env.TEAMSPEAK_ENABLED === "true") {
-      await this.teamSpeak.connect({
-        host: process.env.TEAMSPEAK_HOST || "localhost",
-        queryport: parseInt(process.env.TEAMSPEAK_QUERY_PORT || "10011"),
-        username: process.env.TEAMSPEAK_USERNAME || "serveradmin",
-        password: process.env.TEAMSPEAK_PASSWORD || "",
-        nickname: process.env.TEAMSPEAK_NICKNAME || "SnailyCAD Dispatch",
-      });
+      try {
+        await this.teamSpeak.connect({
+          host: process.env.TEAMSPEAK_HOST || "localhost",
+          queryport: parseInt(process.env.TEAMSPEAK_QUERY_PORT || "10011"),
+          username: process.env.TEAMSPEAK_USERNAME || "serveradmin",
+          password: process.env.TEAMSPEAK_PASSWORD || "",
+          nickname: process.env.TEAMSPEAK_NICKNAME || "SnailyCAD Dispatch",
+        });
+      } catch (error) {
+        console.error("❌ Failed to initialize TeamSpeak:", error);
+      }
     }
   }
-
-  // ====================== API Endpoints ======================
 
   @Get("/")
   @Description("Get all 911 calls")
@@ -267,18 +336,6 @@ export class Calls911Controller {
       include: callInclude,
     });
 
-    if (data.gtaMapPosition) {
-      await prisma.gTAMapPosition.create({
-        data: {
-          x: data.gtaMapPosition.x,
-          y: data.gtaMapPosition.y,
-          z: data.gtaMapPosition.z,
-          heading: data.gtaMapPosition.heading,
-          Call911: { connect: { id: call.id } },
-        },
-      });
-    }
-
     const unitIds = (data.assignedUnits ?? []) as z.infer<typeof ASSIGNED_UNIT>[];
     await assignUnitsTo911Call({
       call,
@@ -311,13 +368,13 @@ export class Calls911Controller {
       await sendDiscordWebhook({ type: DiscordWebhookType.CALL_911, data: webhookData });
       await sendRawWebhook({ type: DiscordWebhookType.CALL_911, data: normalizedCall });
     } catch (error) {
-      console.error("Discord webhook error:", error);
+      console.error("❌ Discord webhook error:", error);
     }
 
     try {
       await this.sendTeamSpeakNotification(normalizedCall, user.locale);
     } catch (error) {
-      console.error("TeamSpeak notification error:", error);
+      console.error("❌ TeamSpeak notification error:", error);
     }
 
     this.socket.emit911Call(normalizedCall);
@@ -331,9 +388,15 @@ export class Calls911Controller {
   })
   async getCallById(@PathParams("id") id: string): Promise<APITypes.Get911CallByIdData> {
     const where = Number.isNaN(parseInt(id)) ? { id } : { caseNumber: parseInt(id) };
-    const call = await prisma.call911.findFirst({ where, include: callInclude });
+    const call = await prisma.call911.findFirst({
+      where,
+      include: callInclude,
+    });
 
-    if (!call) throw new NotFound("callNotFound");
+    if (!call) {
+      throw new NotFound("callNotFound");
+    }
+
     return officerOrDeputyToUnit(call);
   }
 
@@ -353,59 +416,29 @@ export class Calls911Controller {
       include: { assignedUnits: assignedUnitsInclude, departments: true, divisions: true },
     });
 
-    if (!call || call.ended) throw new NotFound("callNotFound");
-
-    const position = data.position ? await prisma.position.upsert({
-      where: { id: call.positionId ?? "undefined" },
-      create: {
-        lat: parseFloat(data.position.lat) || 0.0,
-        lng: parseFloat(data.position.lng) || 0.0,
-      },
-      update: {
-        lat: parseFloat(data.position.lat) || 0.0,
-        lng: parseFloat(data.position.lng) || 0.0,
-      },
-    }) : null;
+    if (!call || call.ended) {
+      throw new NotFound("callNotFound");
+    }
 
     await prisma.call911.update({
-      where: { id },
+      where: { id: call.id },
       data: {
         location: data.location,
         postal: data.postal,
         description: data.descriptionData ? null : data.description,
         name: data.name,
         userId: user.id,
-        positionId: data.position === null ? null : position?.id ?? call.positionId,
         descriptionData: data.descriptionData ?? undefined,
         situationCodeId: data.situationCode === null ? null : data.situationCode,
         typeId: data.type,
         extraFields: data.extraFields || undefined,
         status: (data.status as WhitelistStatus | null) || undefined,
-        gtaMapPositionId: data.gtaMapPosition === null ? null : undefined,
         ...(data.description || data.descriptionData) ? {
           priority: undefined,
           priorityReason: undefined
         } : {}
       },
     });
-
-    if (data.gtaMapPosition) {
-      await prisma.gTAMapPosition.upsert({
-        where: { id: String(call.gtaMapPositionId) },
-        create: {
-          x: data.gtaMapPosition.x,
-          y: data.gtaMapPosition.y,
-          z: data.gtaMapPosition.z,
-          heading: data.gtaMapPosition.heading,
-        },
-        update: {
-          x: data.gtaMapPosition.x,
-          y: data.gtaMapPosition.y,
-          z: data.gtaMapPosition.z,
-          heading: data.gtaMapPosition.heading,
-        },
-      });
-    }
 
     if (data.description || data.descriptionData) {
       const priorityAnalysis = await this.gemini.analyzeCallPriority({
@@ -415,7 +448,7 @@ export class Calls911Controller {
       });
 
       await prisma.call911.update({
-        where: { id },
+        where: { id: call.id },
         data: {
           priority: priorityAnalysis.priority,
           priorityReason: priorityAnalysis.reasoning,
@@ -440,7 +473,7 @@ export class Calls911Controller {
     }
 
     const updated = await prisma.call911.findUnique({
-      where: { id },
+      where: { id: call.id },
       include: callInclude,
     });
 
@@ -457,11 +490,15 @@ export class Calls911Controller {
     @BodyParams("ids") ids: string[],
     @Context("sessionUserId") sessionUserId: string,
   ): Promise<APITypes.DeletePurge911CallsData> {
-    if (!Array.isArray(ids)) return false;
+    if (!Array.isArray(ids)) {
+      return false;
+    }
 
     await Promise.all(
       ids.map(async (id) => {
-        const call = await prisma.call911.delete({ where: { id } });
+        const call = await prisma.call911.delete({
+          where: { id },
+        });
         this.socket.emit911CallDelete(call);
       }),
     );
@@ -486,7 +523,9 @@ export class Calls911Controller {
       include: { assignedUnits: true },
     });
 
-    if (!call || call.ended) throw new NotFound("callNotFound");
+    if (!call || call.ended) {
+      throw new NotFound("callNotFound");
+    }
 
     await handleEndCall({ call, socket: this.socket });
     await Promise.all([
@@ -512,7 +551,9 @@ export class Calls911Controller {
       include: { incidents: true },
     });
 
-    if (!call) throw new NotFound("callNotFound");
+    if (!call) {
+      throw new NotFound("callNotFound");
+    }
 
     const disconnectConnectArr = manyToManyHelper(
       call.incidents.map((v) => v.id),
@@ -547,13 +588,22 @@ export class Calls911Controller {
     @BodyParams("unit") rawUnitId: string | null,
     @QueryParams("force", Boolean) force = false,
   ): Promise<APITypes.Post911CallAssignUnAssign> {
-    if (!rawUnitId) throw new BadRequest("unitIsRequired");
+    if (!rawUnitId) {
+      throw new BadRequest("unitIsRequired");
+    }
 
     const { unit, type } = await findUnit(rawUnitId);
-    if (!unit) throw new NotFound("unitNotFound");
+    if (!unit) {
+      throw new NotFound("unitNotFound");
+    }
 
-    const call = await prisma.call911.findUnique({ where: { id: callId } });
-    if (!call) throw new NotFound("callNotFound");
+    const call = await prisma.call911.findUnique({
+      where: { id: callId },
+    });
+
+    if (!call) {
+      throw new NotFound("callNotFound");
+    }
 
     const types = {
       "combined-leo": "combinedLeoId",
@@ -563,17 +613,31 @@ export class Calls911Controller {
     };
 
     const existing = await prisma.assignedUnit.findFirst({
-      where: { call911Id: callId, [types[type]]: unit.id },
+      where: {
+        call911Id: callId,
+        [types[type]]: unit.id,
+      },
     });
 
     if (callType === "assign") {
-      if (existing) throw new BadRequest("alreadyAssignedToCall");
+      if (existing) {
+        throw new BadRequest("alreadyAssignedToCall");
+      }
+
       await prisma.assignedUnit.create({
-        data: { call911Id: callId, [types[type]]: unit.id },
+        data: {
+          call911Id: callId,
+          [types[type]]: unit.id,
+        },
       });
     } else {
-      if (!existing) throw new BadRequest("notAssignedToCall");
-      await prisma.assignedUnit.delete({ where: { id: existing.id } });
+      if (!existing) {
+        throw new BadRequest("notAssignedToCall");
+      }
+
+      await prisma.assignedUnit.delete({
+        where: { id: existing.id },
+      });
     }
 
     const prismaNames = {
@@ -631,8 +695,13 @@ export class Calls911Controller {
     @BodyParams() body: unknown,
   ): Promise<APITypes.PUT911CallAssignedUnit> {
     const data = validateSchema(UPDATE_ASSIGNED_UNIT_SCHEMA, body);
-    const call = await prisma.call911.findUnique({ where: { id: callId } });
-    if (!call) throw new NotFound("callNotFound");
+    const call = await prisma.call911.findUnique({
+      where: { id: callId },
+    });
+
+    if (!call) {
+      throw new NotFound("callNotFound");
+    }
 
     if (data.isPrimary) {
       await prisma.assignedUnit.updateMany({
@@ -644,13 +713,19 @@ export class Calls911Controller {
     const assignedUnit = await prisma.assignedUnit.findUnique({
       where: { id: assignedUnitId },
     });
-    if (!assignedUnit) throw new NotFound("unitNotFound");
+
+    if (!assignedUnit) {
+      throw new NotFound("unitNotFound");
+    }
 
     const updatedCall = await prisma.call911.update({
       where: { id: call.id },
       data: {
         assignedUnits: {
-          update: { where: { id: assignedUnit.id }, data: { isPrimary: data.isPrimary } },
+          update: {
+            where: { id: assignedUnit.id },
+            data: { isPrimary: data.isPrimary },
+          },
         },
       },
       include: callInclude,
@@ -661,25 +736,34 @@ export class Calls911Controller {
     return normalizedCall;
   }
 
-  // ====================== Helper Methods ======================
-
   private async sendTeamSpeakNotification(call: Call911, locale?: string | null) {
-    if (!this.teamSpeak) return;
+    if (!this.teamSpeak || process.env.TEAMSPEAK_ENABLED !== "true") {
+      return;
+    }
 
     const t = await getTranslator({ type: "webhooks", locale, namespace: "Calls" });
-    const description = call.descriptionData 
-      ? slateDataToString(call.descriptionData) 
-      : call.description || t("noDescription");
+    const formattedDescription = slateDataToString(call.descriptionData as Descendant[] | null);
+    
+    const caller = call.name || t("unknown");
+    const location = `${call.location} ${call.postal ? call.postal : ""}`;
+    const description = call.description || formattedDescription || t("couldNotRenderDescription");
 
-    const message = [
-      `📞 911 Call | Priority ${call.priority || 3}`,
-      `Caller: ${call.name || t("unknown")}`,
-      `Location: ${call.location}${call.postal ? ` (${call.postal})` : ""}`,
-      `Type: ${call.type}`,
-      `Desc: ${description.substring(0, 50)}${description.length > 50 ? "..." : ""}`
-    ].join(" | ");
+    let message = `📞 911 CALL | Priority ${call.priority || 3} | ${caller} | ${location}`;
+    
+    if (description) {
+      const maxLength = 100 - message.length;
+      const truncatedDesc = description.length > maxLength 
+        ? `${description.substring(0, maxLength)}...` 
+        : description;
+      message += ` | ${truncatedDesc}`;
+    }
 
-    await this.teamSpeak.sendMessageToChannel(process.env.TEAMSPEAK_CHANNEL_ID || "1", message);
+    try {
+      const channelId = process.env.TEAMSPEAK_CHANNEL_ID || "1";
+      await this.teamSpeak.sendMessageToChannel(channelId, message);
+    } catch (error) {
+      console.error("❌ Failed to send TeamSpeak notification:", error);
+    }
   }
 
   private async createWebhookData(
@@ -687,22 +771,31 @@ export class Calls911Controller {
     locale?: string | null,
   ): Promise<{ embeds: APIEmbed[] }> {
     const t = await getTranslator({ type: "webhooks", locale, namespace: "Calls" });
-    const description = call.descriptionData 
-      ? slateDataToString(call.descriptionData) 
-      : call.description || t("noDescription");
+    const formattedDescription = slateDataToString(call.descriptionData as Descendant[] | null);
+
+    const caller = call.name || t("unknown");
+    const location = `${call.location} ${call.postal ? call.postal : ""}`;
+    const description = call.description || formattedDescription || t("couldNotRenderDescription");
 
     return {
-      embeds: [{
-        title: t("callCreated"),
-        description,
-        fields: [
-          { name: t("caller"), value: call.name || t("unknown"), inline: true },
-          { name: t("location"), value: `${call.location}${call.postal ? ` (${call.postal})` : ""}`, inline: true },
-          { name: "Priority", value: `${call.priority || 3}${call.priorityReason ? ` (${call.priorityReason})` : ""}`, inline: true },
-        ],
-        color: this.getPriorityColor(call.priority),
-        timestamp: new Date().toISOString(),
-      }]
+      embeds: [
+        {
+          title: t("callCreated"),
+          description,
+          footer: { text: t("viewMoreInfo") },
+          fields: [
+            { name: t("location"), value: location, inline: true },
+            { name: t("caller"), value: caller, inline: true },
+            { 
+              name: "Priority", 
+              value: `${call.priority || 3}${call.priorityReason ? ` (${call.priorityReason})` : ""}`, 
+              inline: true 
+            },
+          ],
+          color: this.getPriorityColor(call.priority),
+          timestamp: new Date().toISOString(),
+        },
+      ],
     };
   }
 

@@ -1299,6 +1299,8 @@ model ChatCreator {
 
 // 911 calls & bolos
 model Call911 {
+  priority       Int?    @default(3)    
+  priorityReason String?                
   id                String              @id @default(cuid())
   caseNumber        Int                 @default(autoincrement())
   createdAt         DateTime            @default(now())

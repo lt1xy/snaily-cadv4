@@ -46,6 +46,7 @@ import { AuditLogActionType, createAuditLogEntry } from "@snailycad/audit-logger
 import { isFeatureEnabled } from "lib/upsert-cad";
 import { _leoProperties, assignedUnitsInclude, callInclude } from "utils/leo/includes";
 import { slateDataToString, type Descendant } from "@snailycad/utils/editor";
+import { TeamSpeakService } from "services/teamspeak-service";
 
 @Controller("/911-calls")
 @UseBeforeEach(IsAuth)
@@ -53,8 +54,34 @@ import { slateDataToString, type Descendant } from "@snailycad/utils/editor";
 @IsFeatureEnabled({ feature: Feature.CALLS_911 })
 export class Calls911Controller {
   private socket: Socket;
+  private teamSpeak: TeamSpeakService;
+
   constructor(socket: Socket) {
     this.socket = socket;
+    this.teamSpeak = new TeamSpeakService();
+    
+    this.initializeTeamSpeak().catch((error) => {
+      console.error("Failed to initialize TeamSpeak:", error);
+    });
+  }
+
+  private async initializeTeamSpeak() {
+    if (process.env.TEAMSPEAK_ENABLED === "true") {
+      const config = {
+        host: process.env.TEAMSPEAK_HOST || "localhost",
+        queryport: parseInt(process.env.TEAMSPEAK_QUERY_PORT || "10011"),
+        username: process.env.TEAMSPEAK_USERNAME || "serveradmin",
+        password: process.env.TEAMSPEAK_PASSWORD || "",
+        nickname: process.env.TEAMSPEAK_NICKNAME || "SnailyCAD Dispatch",
+      };
+
+      if (!config.host || !config.username || !config.password) {
+        console.warn("TeamSpeak credentials not fully configured. TeamSpeak integration disabled.");
+        return;
+      }
+
+      await this.teamSpeak.connect(config);
+    }
   }
 
   @Get("/")
@@ -113,11 +140,6 @@ export class Calls911Controller {
         { assignedUnits: { some: { combinedLeoId: assignedUnit } } },
       );
     }
-
-    // todo
-    // isFromServer
-    // if the request is from the server, we want to only return information that is required to render the UI.
-    // once the UI is rendered, we can then fetch the rest of the data.
 
     const [totalCount, calls] = await Promise.all([
       prisma.call911.count({ where }),
@@ -252,6 +274,12 @@ export class Calls911Controller {
       await sendRawWebhook({ type: DiscordWebhookType.CALL_911, data: normalizedCall });
     } catch (error) {
       console.error("Could not send Discord webhook.", error);
+    }
+
+    try {
+      await this.sendTeamSpeakNotification(normalizedCall, user.locale);
+    } catch (error) {
+      console.error("Could not send TeamSpeak notification:", error);
     }
 
     this.socket.emit911Call(normalizedCall);
@@ -638,7 +666,30 @@ export class Calls911Controller {
     return normalizedCall;
   }
 
-  // creates the webhook structure that will get sent to Discord.
+  private async sendTeamSpeakNotification(call: Call911, locale?: string | null) {
+    if (!this.teamSpeak.connectionStatus) return;
+
+    const t = await getTranslator({ type: "webhooks", locale, namespace: "Calls" });
+    const formattedDescription = slateDataToString(call.descriptionData as Descendant[] | null);
+    
+    const caller = call.name || t("unknown");
+    const location = `${call.location} ${call.postal ? call.postal : ""}`;
+    const description = call.description || formattedDescription || t("couldNotRenderDescription");
+
+    let message = `📞 911 CALL | ${caller} | ${location}`;
+    
+    if (description) {
+      const maxLength = 100 - message.length;
+      const truncatedDesc = description.length > maxLength 
+        ? `${description.substring(0, maxLength)}...` 
+        : description;
+      message += ` | ${truncatedDesc}`;
+    }
+
+    const channelId = process.env.TEAMSPEAK_CHANNEL_ID || "1";
+    await this.teamSpeak.sendMessageToChannel(channelId, message);
+  }
+
   private async createWebhookData(
     call: Call911,
     locale?: string | null,

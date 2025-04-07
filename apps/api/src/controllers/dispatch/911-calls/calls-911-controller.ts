@@ -254,20 +254,20 @@ export class Calls911Controller {
         { postal: { contains: query, mode: "insensitive" } },
         { location: { contains: query, mode: "insensitive" } },
         { description: { contains: query, mode: "insensitive" } },
-        { type: { value: { value: { contains: query, mode: "insensitive" } } },
-        { situationCode: { value: { value: { contains: query, mode: "insensitive" } } },
+        { type: { value: { value: { contains: query, mode: "insensitive" } } } },
+        { situationCode: { value: { value: { contains: query, mode: "insensitive" } } } },
       ] : undefined,
     };
 
     if (department || division || assignedUnit) {
       where.OR = where.OR || [];
-      if (department) where.OR.push({ departments: { some: { id: department } });
-      if (division) where.OR.push({ divisions: { some: { id: division } });
+      if (department) where.OR.push({ departments: { some: { id: department } } });
+      if (division) where.OR.push({ divisions: { some: { id: division } } });
       if (assignedUnit) where.OR.push(
-        { assignedUnits: { some: { id: assignedUnit } },
-        { assignedUnits: { some: { officerId: assignedUnit } },
-        { assignedUnits: { some: { emsFdDeputyId: assignedUnit } },
-        { assignedUnits: { some: { combinedLeoId: assignedUnit } },
+        { assignedUnits: { some: { id: assignedUnit } } },
+        { assignedUnits: { some: { officerId: assignedUnit } } },
+        { assignedUnits: { some: { emsFdDeputyId: assignedUnit } } },
+        { assignedUnits: { some: { combinedLeoId: assignedUnit } } },
       );
     }
 

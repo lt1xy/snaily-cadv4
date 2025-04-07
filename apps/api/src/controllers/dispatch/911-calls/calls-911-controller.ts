@@ -46,7 +46,89 @@ import { AuditLogActionType, createAuditLogEntry } from "@snailycad/audit-logger
 import { isFeatureEnabled } from "lib/upsert-cad";
 import { _leoProperties, assignedUnitsInclude, callInclude } from "utils/leo/includes";
 import { slateDataToString, type Descendant } from "@snailycad/utils/editor";
-import { TeamSpeakService } from "services/teamspeak-service";
+import { TeamSpeak } from "teamspeak-client";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+// ======================== Services ========================
+
+class TeamSpeakService {
+  private client: TeamSpeak;
+  private isConnected = false;
+
+  constructor() {
+    this.client = new TeamSpeak();
+  }
+
+  async connect(config: {
+    host: string;
+    queryport: number;
+    username: string;
+    password: string;
+    nickname: string;
+  }) {
+    try {
+      await this.client.connect(config);
+      this.isConnected = true;
+      console.log("TeamSpeak connected successfully");
+    } catch (error) {
+      console.error("TeamSpeak connection failed:", error);
+      throw error;
+    }
+  }
+
+  async sendMessageToChannel(channelId: string, message: string) {
+    if (!this.isConnected) {
+      console.warn("TeamSpeak not connected, message not sent");
+      return;
+    }
+
+    try {
+      await this.client.send("sendtextmessage", {
+        targetmode: 2,
+        target: channelId,
+        msg: message,
+      });
+      console.log("TeamSpeak notification sent");
+    } catch (error) {
+      console.error("Failed to send TeamSpeak message:", error);
+    }
+  }
+}
+
+class GeminiAIService {
+  private genAI: GoogleGenerativeAI;
+  private model: any;
+
+  constructor() {
+    this.genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+    this.model = this.genAI.getGenerativeModel({ model: "gemini-pro" });
+  }
+
+  async analyzeCallPriority(callData: {
+    description: string;
+    location: string;
+    callType: string;
+  }): Promise<{ priority: number; reasoning: string }> {
+    const prompt = `Analyze this 911 call and assign a priority (1=highest, 5=lowest):
+    Type: ${callData.callType}
+    Location: ${callData.location}
+    Description: ${callData.description}
+    
+    Respond with JSON ONLY: { "priority": number, "reasoning": string }`;
+
+    try {
+      const result = await this.model.generateContent(prompt);
+      const response = await result.response;
+      const text = response.text();
+      return JSON.parse(text.trim());
+    } catch (error) {
+      console.error("Gemini AI error:", error);
+      return { priority: 3, reasoning: "Default priority - analysis failed" };
+    }
+  }
+}
+
+// ======================== Controller ========================
 
 @Controller("/911-calls")
 @UseBeforeEach(IsAuth)
@@ -55,34 +137,29 @@ import { TeamSpeakService } from "services/teamspeak-service";
 export class Calls911Controller {
   private socket: Socket;
   private teamSpeak: TeamSpeakService;
+  private gemini: GeminiAIService;
 
   constructor(socket: Socket) {
     this.socket = socket;
     this.teamSpeak = new TeamSpeakService();
+    this.gemini = new GeminiAIService();
     
-    this.initializeTeamSpeak().catch((error) => {
-      console.error("Failed to initialize TeamSpeak:", error);
-    });
+    this.initializeServices().catch(console.error);
   }
 
-  private async initializeTeamSpeak() {
+  private async initializeServices() {
     if (process.env.TEAMSPEAK_ENABLED === "true") {
-      const config = {
+      await this.teamSpeak.connect({
         host: process.env.TEAMSPEAK_HOST || "localhost",
         queryport: parseInt(process.env.TEAMSPEAK_QUERY_PORT || "10011"),
         username: process.env.TEAMSPEAK_USERNAME || "serveradmin",
         password: process.env.TEAMSPEAK_PASSWORD || "",
         nickname: process.env.TEAMSPEAK_NICKNAME || "SnailyCAD Dispatch",
-      };
-
-      if (!config.host || !config.username || !config.password) {
-        console.warn("TeamSpeak credentials not fully configured. TeamSpeak integration disabled.");
-        return;
-      }
-
-      await this.teamSpeak.connect(config);
+      });
     }
   }
+
+  // ====================== API Endpoints ======================
 
   @Get("/")
   @Description("Get all 911 calls")
@@ -99,45 +176,29 @@ export class Calls911Controller {
     @QueryParams("assignedUnit", String) assignedUnit?: string,
   ): Promise<APITypes.Get911CallsData> {
     const inactivityFilter = getInactivityFilter(cad, "call911InactivityTimeout");
-    const inactivityFilterWhere = includeEnded ? {} : inactivityFilter?.filter;
-
     const where: Prisma.Call911WhereInput = {
-      ...(inactivityFilterWhere ?? {}),
+      ...(includeEnded ? {} : inactivityFilter?.filter ?? {}),
       ended: includeEnded ? undefined : false,
-      OR: query
-        ? [
-            { descriptionData: { array_contains: query } },
-            { name: { contains: query, mode: "insensitive" } },
-            { postal: { contains: query, mode: "insensitive" } },
-            { location: { contains: query, mode: "insensitive" } },
-            { description: { contains: query, mode: "insensitive" } },
-            { type: { value: { value: { contains: query, mode: "insensitive" } } } },
-            { situationCode: { value: { value: { contains: query, mode: "insensitive" } } } },
-          ]
-        : undefined,
+      OR: query ? [
+        { descriptionData: { array_contains: query } },
+        { name: { contains: query, mode: "insensitive" } },
+        { postal: { contains: query, mode: "insensitive" } },
+        { location: { contains: query, mode: "insensitive" } },
+        { description: { contains: query, mode: "insensitive" } },
+        { type: { value: { value: { contains: query, mode: "insensitive" } } },
+        { situationCode: { value: { value: { contains: query, mode: "insensitive" } } },
+      ] : undefined,
     };
 
     if (department || division || assignedUnit) {
-      where.OR = [];
-    }
-
-    if (parseInt(query) && where.OR) {
-      where.OR.push({ caseNumber: { equals: parseInt(query) } });
-    }
-
-    if (department && where.OR) {
-      where.OR.push({ departments: { some: { id: department } } });
-    }
-    if (division && where.OR) {
-      where.OR.push({ divisions: { some: { id: division } } });
-    }
-
-    if (assignedUnit && where.OR) {
-      where.OR.push(
-        { assignedUnits: { some: { id: assignedUnit } } },
-        { assignedUnits: { some: { officerId: assignedUnit } } },
-        { assignedUnits: { some: { emsFdDeputyId: assignedUnit } } },
-        { assignedUnits: { some: { combinedLeoId: assignedUnit } } },
+      where.OR = where.OR || [];
+      if (department) where.OR.push({ departments: { some: { id: department } });
+      if (division) where.OR.push({ divisions: { some: { id: division } });
+      if (assignedUnit) where.OR.push(
+        { assignedUnits: { some: { id: assignedUnit } },
+        { assignedUnits: { some: { officerId: assignedUnit } },
+        { assignedUnits: { some: { emsFdDeputyId: assignedUnit } },
+        { assignedUnits: { some: { combinedLeoId: assignedUnit } },
       );
     }
 
@@ -155,39 +216,12 @@ export class Calls911Controller {
     return { totalCount, calls: calls.map(officerOrDeputyToUnit) };
   }
 
-  @Get("/:id")
-  @Description("Get a call by its id or caseNumber")
-  @UsePermissions({
-    permissions: [Permissions.Dispatch, Permissions.Leo, Permissions.EmsFd],
-  })
-  async getCallById(@PathParams("id") id: string): Promise<APITypes.Get911CallByIdData> {
-    let where: Prisma.Call911WhereInput = {};
-
-    if (Number.isNaN(parseInt(id))) {
-      where = { id };
-    } else {
-      where = { caseNumber: parseInt(id) };
-    }
-
-    const call = await prisma.call911.findFirst({
-      where,
-      include: callInclude,
-    });
-
-    if (!call) {
-      throw new NotFound("callNotFound");
-    }
-
-    return officerOrDeputyToUnit(call);
-  }
-
   @Post("/")
   async create911Call(
     @BodyParams() body: unknown,
     @Context("user") user: User,
-    @Context("cad")
-    cad: cad & { features?: Record<Feature, boolean>; miscCadSettings: MiscCadSettings },
-    @HeaderParams("is-from-dispatch") isFromDispatchHeader?: string | undefined,
+    @Context("cad") cad: cad & { features?: Record<Feature, boolean>; miscCadSettings: MiscCadSettings },
+    @HeaderParams("is-from-dispatch") isFromDispatchHeader?: string,
   ): Promise<APITypes.Post911CallsData> {
     const data = validateSchema(CALL_911_SCHEMA, body);
     const hasDispatchPermissions = hasPermission({
@@ -197,17 +231,22 @@ export class Calls911Controller {
 
     const isFromDispatch = isFromDispatchHeader === "true" && hasDispatchPermissions;
     const maxAssignmentsToCalls = cad.miscCadSettings.maxAssignmentsToCalls ?? Infinity;
-
     const isCallApprovalEnabled = isFeatureEnabled({
       defaultReturn: false,
       feature: Feature.CALL_911_APPROVAL,
       features: cad.features,
     });
+
     const activeDispatchers = await prisma.activeDispatchers.count();
     const hasActiveDispatchers = activeDispatchers > 0;
     const shouldCallBePending = isCallApprovalEnabled && hasActiveDispatchers && !isFromDispatch;
-
     const callStatus = shouldCallBePending ? WhitelistStatus.PENDING : WhitelistStatus.ACCEPTED;
+
+    const priorityAnalysis = await this.gemini.analyzeCallPriority({
+      description: data.descriptionData ? slateDataToString(data.descriptionData) : data.description || "",
+      location: data.location || "",
+      callType: data.type,
+    });
 
     const call = await prisma.call911.create({
       data: {
@@ -222,6 +261,8 @@ export class Calls911Controller {
         typeId: data.type,
         extraFields: data.extraFields || undefined,
         status: callStatus,
+        priority: priorityAnalysis.priority,
+        priorityReason: priorityAnalysis.reasoning,
       },
       include: callInclude,
     });
@@ -260,30 +301,40 @@ export class Calls911Controller {
     const normalizedCall = officerOrDeputyToUnit(updated);
 
     await createAuditLogEntry({
-      action: {
-        type: AuditLogActionType.Call911Create,
-        new: normalizedCall,
-      },
+      action: { type: AuditLogActionType.Call911Create, new: normalizedCall },
       executorId: user.id,
       prisma,
     });
 
     try {
-      const data = await this.createWebhookData(normalizedCall, user.locale);
-      await sendDiscordWebhook({ type: DiscordWebhookType.CALL_911, data });
+      const webhookData = await this.createWebhookData(normalizedCall, user.locale);
+      await sendDiscordWebhook({ type: DiscordWebhookType.CALL_911, data: webhookData });
       await sendRawWebhook({ type: DiscordWebhookType.CALL_911, data: normalizedCall });
     } catch (error) {
-      console.error("Could not send Discord webhook.", error);
+      console.error("Discord webhook error:", error);
     }
 
     try {
       await this.sendTeamSpeakNotification(normalizedCall, user.locale);
     } catch (error) {
-      console.error("Could not send TeamSpeak notification:", error);
+      console.error("TeamSpeak notification error:", error);
     }
 
     this.socket.emit911Call(normalizedCall);
     return normalizedCall;
+  }
+
+  @Get("/:id")
+  @Description("Get a call by its id or caseNumber")
+  @UsePermissions({
+    permissions: [Permissions.Dispatch, Permissions.Leo, Permissions.EmsFd],
+  })
+  async getCallById(@PathParams("id") id: string): Promise<APITypes.Get911CallByIdData> {
+    const where = Number.isNaN(parseInt(id)) ? { id } : { caseNumber: parseInt(id) };
+    const call = await prisma.call911.findFirst({ where, include: callInclude });
+
+    if (!call) throw new NotFound("callNotFound");
+    return officerOrDeputyToUnit(call);
   }
 
   @Put("/:id")
@@ -297,113 +348,104 @@ export class Calls911Controller {
     @Context("cad") cad: cad & { miscCadSettings: MiscCadSettings },
   ): Promise<APITypes.Put911CallByIdData> {
     const data = validateSchema(CALL_911_SCHEMA.partial(), body);
-    const maxAssignmentsToCalls = cad.miscCadSettings.maxAssignmentsToCalls ?? Infinity;
-
     const call = await prisma.call911.findUnique({
-      where: {
-        id,
-      },
-      include: {
-        assignedUnits: assignedUnitsInclude,
-        departments: true,
-        divisions: true,
-      },
+      where: { id },
+      include: { assignedUnits: assignedUnitsInclude, departments: true, divisions: true },
     });
 
-    if (!call || call.ended) {
-      throw new NotFound("callNotFound");
-    }
+    if (!call || call.ended) throw new NotFound("callNotFound");
 
-    const positionData = data.position ?? null;
-    const shouldRemovePosition = data.position === null;
-
-    const position = positionData
-      ? await prisma.position.upsert({
-          where: {
-            id: call.positionId ?? "undefined",
-          },
-          create: {
-            lat: positionData.lat ? parseFloat(positionData.lat) : 0.0,
-            lng: positionData.lng ? parseFloat(positionData.lng) : 0.0,
-          },
-          update: {
-            lat: positionData.lat ? parseFloat(positionData.lat) : 0.0,
-            lng: positionData.lng ? parseFloat(positionData.lng) : 0.0,
-          },
-        })
-      : null;
+    const position = data.position ? await prisma.position.upsert({
+      where: { id: call.positionId ?? "undefined" },
+      create: {
+        lat: parseFloat(data.position.lat) || 0.0,
+        lng: parseFloat(data.position.lng) || 0.0,
+      },
+      update: {
+        lat: parseFloat(data.position.lat) || 0.0,
+        lng: parseFloat(data.position.lng) || 0.0,
+      },
+    }) : null;
 
     await prisma.call911.update({
-      where: {
-        id: call.id,
-      },
+      where: { id },
       data: {
         location: data.location,
         postal: data.postal,
         description: data.descriptionData ? null : data.description,
         name: data.name,
         userId: user.id,
-        positionId: shouldRemovePosition ? null : position?.id ?? call.positionId,
+        positionId: data.position === null ? null : position?.id ?? call.positionId,
         descriptionData: data.descriptionData ?? undefined,
         situationCodeId: data.situationCode === null ? null : data.situationCode,
         typeId: data.type,
         extraFields: data.extraFields || undefined,
         status: (data.status as WhitelistStatus | null) || undefined,
         gtaMapPositionId: data.gtaMapPosition === null ? null : undefined,
+        ...(data.description || data.descriptionData) ? {
+          priority: undefined,
+          priorityReason: undefined
+        } : {}
       },
     });
 
     if (data.gtaMapPosition) {
-      const createUpdateData = {
-        x: data.gtaMapPosition.x,
-        y: data.gtaMapPosition.y,
-        z: data.gtaMapPosition.z,
-        heading: data.gtaMapPosition.heading,
-      };
-
       await prisma.gTAMapPosition.upsert({
         where: { id: String(call.gtaMapPositionId) },
-        create: createUpdateData,
-        update: createUpdateData,
+        create: {
+          x: data.gtaMapPosition.x,
+          y: data.gtaMapPosition.y,
+          z: data.gtaMapPosition.z,
+          heading: data.gtaMapPosition.heading,
+        },
+        update: {
+          x: data.gtaMapPosition.x,
+          y: data.gtaMapPosition.y,
+          z: data.gtaMapPosition.z,
+          heading: data.gtaMapPosition.heading,
+        },
       });
     }
 
-    const unitIds = (data.assignedUnits ?? []) as z.infer<typeof ASSIGNED_UNIT>[];
+    if (data.description || data.descriptionData) {
+      const priorityAnalysis = await this.gemini.analyzeCallPriority({
+        description: data.descriptionData ? slateDataToString(data.descriptionData) : data.description || "",
+        location: data.location || call.location,
+        callType: data.type || call.typeId,
+      });
+
+      await prisma.call911.update({
+        where: { id },
+        data: {
+          priority: priorityAnalysis.priority,
+          priorityReason: priorityAnalysis.reasoning,
+        },
+      });
+    }
 
     if (data.assignedUnits) {
       await assignUnitsTo911Call({
-        call,
-        maxAssignmentsToCalls,
-        unitIds,
+        call: { ...call, id },
+        maxAssignmentsToCalls: cad.miscCadSettings.maxAssignmentsToCalls ?? Infinity,
+        unitIds: data.assignedUnits as z.infer<typeof ASSIGNED_UNIT>[],
       });
     }
-
-    await Promise.all([
-      this.socket.emitUpdateOfficerStatus(),
-      this.socket.emitUpdateDeputyStatus(),
-    ]);
 
     if (data.departments || data.divisions) {
       await linkOrUnlinkCallDepartmentsAndDivisions({
         departments: (data.departments ?? []) as string[],
         divisions: (data.divisions ?? []) as string[],
-        call,
+        call: { ...call, id },
       });
     }
 
     const updated = await prisma.call911.findUnique({
-      where: {
-        id: call.id,
-      },
+      where: { id },
       include: callInclude,
     });
 
     const normalizedCall = officerOrDeputyToUnit(updated);
-    this.socket.emitUpdate911Call({
-      ...normalizedCall,
-      notifyAssignedUnits: data.notifyAssignedUnits,
-    });
-
+    this.socket.emitUpdate911Call(normalizedCall);
     return normalizedCall;
   }
 
@@ -419,10 +461,7 @@ export class Calls911Controller {
 
     await Promise.all(
       ids.map(async (id) => {
-        const call = await prisma.call911.delete({
-          where: { id },
-        });
-
+        const call = await prisma.call911.delete({ where: { id } });
         this.socket.emit911CallDelete(call);
       }),
     );
@@ -447,9 +486,7 @@ export class Calls911Controller {
       include: { assignedUnits: true },
     });
 
-    if (!call || call.ended) {
-      throw new NotFound("callNotFound");
-    }
+    if (!call || call.ended) throw new NotFound("callNotFound");
 
     await handleEndCall({ call, socket: this.socket });
     await Promise.all([
@@ -470,15 +507,12 @@ export class Calls911Controller {
     @BodyParams() body: unknown,
   ): Promise<APITypes.PostLink911CallToIncident> {
     const data = validateSchema(LINK_INCIDENT_TO_CALL_SCHEMA, body);
-
     const call = await prisma.call911.findUnique({
       where: { id: callId },
       include: { incidents: true },
     });
 
-    if (!call) {
-      throw new NotFound("callNotFound");
-    }
+    if (!call) throw new NotFound("callNotFound");
 
     const disconnectConnectArr = manyToManyHelper(
       call.incidents.map((v) => v.id),
@@ -497,9 +531,10 @@ export class Calls911Controller {
       include: { incidents: { include: incidentInclude } },
     });
 
-    const callIncidents = updated?.incidents.map((v) => officerOrDeputyToUnit(v)) ?? [];
-
-    return officerOrDeputyToUnit({ ...call, incidents: callIncidents });
+    return officerOrDeputyToUnit({
+      ...call,
+      incidents: updated?.incidents.map(officerOrDeputyToUnit) ?? [],
+    });
   }
 
   @Post("/:type/:callId")
@@ -512,22 +547,13 @@ export class Calls911Controller {
     @BodyParams("unit") rawUnitId: string | null,
     @QueryParams("force", Boolean) force = false,
   ): Promise<APITypes.Post911CallAssignUnAssign> {
-    if (!rawUnitId) {
-      throw new BadRequest("unitIsRequired");
-    }
+    if (!rawUnitId) throw new BadRequest("unitIsRequired");
 
     const { unit, type } = await findUnit(rawUnitId);
-    if (!unit) {
-      throw new NotFound("unitNotFound");
-    }
+    if (!unit) throw new NotFound("unitNotFound");
 
-    const call = await prisma.call911.findUnique({
-      where: { id: callId },
-    });
-
-    if (!call) {
-      throw new NotFound("callNotFound");
-    }
+    const call = await prisma.call911.findUnique({ where: { id: callId } });
+    if (!call) throw new NotFound("callNotFound");
 
     const types = {
       "combined-leo": "combinedLeoId",
@@ -537,31 +563,17 @@ export class Calls911Controller {
     };
 
     const existing = await prisma.assignedUnit.findFirst({
-      where: {
-        call911Id: callId,
-        [types[type]]: unit.id,
-      },
+      where: { call911Id: callId, [types[type]]: unit.id },
     });
 
     if (callType === "assign") {
-      if (existing) {
-        throw new BadRequest("alreadyAssignedToCall");
-      }
-
+      if (existing) throw new BadRequest("alreadyAssignedToCall");
       await prisma.assignedUnit.create({
-        data: {
-          call911Id: callId,
-          [types[type]]: unit.id,
-        },
+        data: { call911Id: callId, [types[type]]: unit.id },
       });
     } else {
-      if (!existing) {
-        throw new BadRequest("notAssignedToCall");
-      }
-
-      await prisma.assignedUnit.delete({
-        where: { id: existing.id },
-      });
+      if (!existing) throw new BadRequest("notAssignedToCall");
+      await prisma.assignedUnit.delete({ where: { id: existing.id } });
     }
 
     const prismaNames = {
@@ -575,14 +587,13 @@ export class Calls911Controller {
     const assignedToStatus = await prisma.statusValue.findFirst({
       where: {
         shouldDo: callType === "assign" ? ShouldDoType.SET_ASSIGNED : ShouldDoType.SET_ON_DUTY,
-        OR:
-          callType === "assign"
-            ? undefined
-            : [{ whatPages: { isEmpty: true } }, { whatPages: { has: pageType } }],
+        OR: callType === "assign" ? undefined : [
+          { whatPages: { isEmpty: true } },
+          { whatPages: { has: pageType } },
+        ],
       },
     });
 
-    // @ts-expect-error they have the same properties for updating
     await prisma[prismaNames[type]].update({
       where: { id: unit.id },
       data: {
@@ -602,14 +613,11 @@ export class Calls911Controller {
     ]);
 
     const updated = await prisma.call911.findUnique({
-      where: {
-        id: call.id,
-      },
+      where: { id: call.id },
       include: callInclude,
     });
 
     this.socket.emitUpdate911Call(officerOrDeputyToUnit(updated));
-
     return officerOrDeputyToUnit(updated);
   }
 
@@ -623,14 +631,8 @@ export class Calls911Controller {
     @BodyParams() body: unknown,
   ): Promise<APITypes.PUT911CallAssignedUnit> {
     const data = validateSchema(UPDATE_ASSIGNED_UNIT_SCHEMA, body);
-
-    const call = await prisma.call911.findUnique({
-      where: { id: callId },
-    });
-
-    if (!call) {
-      throw new NotFound("callNotFound");
-    }
+    const call = await prisma.call911.findUnique({ where: { id: callId } });
+    if (!call) throw new NotFound("callNotFound");
 
     if (data.isPrimary) {
       await prisma.assignedUnit.updateMany({
@@ -642,19 +644,13 @@ export class Calls911Controller {
     const assignedUnit = await prisma.assignedUnit.findUnique({
       where: { id: assignedUnitId },
     });
-
-    if (!assignedUnit) {
-      throw new NotFound("unitNotFound");
-    }
+    if (!assignedUnit) throw new NotFound("unitNotFound");
 
     const updatedCall = await prisma.call911.update({
       where: { id: call.id },
       data: {
         assignedUnits: {
-          update: {
-            where: { id: assignedUnit.id },
-            data: { isPrimary: data.isPrimary },
-          },
+          update: { where: { id: assignedUnit.id }, data: { isPrimary: data.isPrimary } },
         },
       },
       include: callInclude,
@@ -662,32 +658,28 @@ export class Calls911Controller {
 
     const normalizedCall = officerOrDeputyToUnit(updatedCall);
     this.socket.emitUpdate911Call(normalizedCall);
-
     return normalizedCall;
   }
 
+  // ====================== Helper Methods ======================
+
   private async sendTeamSpeakNotification(call: Call911, locale?: string | null) {
-    if (!this.teamSpeak.connectionStatus) return;
+    if (!this.teamSpeak) return;
 
     const t = await getTranslator({ type: "webhooks", locale, namespace: "Calls" });
-    const formattedDescription = slateDataToString(call.descriptionData as Descendant[] | null);
-    
-    const caller = call.name || t("unknown");
-    const location = `${call.location} ${call.postal ? call.postal : ""}`;
-    const description = call.description || formattedDescription || t("couldNotRenderDescription");
+    const description = call.descriptionData 
+      ? slateDataToString(call.descriptionData) 
+      : call.description || t("noDescription");
 
-    let message = `📞 911 CALL | ${caller} | ${location}`;
-    
-    if (description) {
-      const maxLength = 100 - message.length;
-      const truncatedDesc = description.length > maxLength 
-        ? `${description.substring(0, maxLength)}...` 
-        : description;
-      message += ` | ${truncatedDesc}`;
-    }
+    const message = [
+      `📞 911 Call | Priority ${call.priority || 3}`,
+      `Caller: ${call.name || t("unknown")}`,
+      `Location: ${call.location}${call.postal ? ` (${call.postal})` : ""}`,
+      `Type: ${call.type}`,
+      `Desc: ${description.substring(0, 50)}${description.length > 50 ? "..." : ""}`
+    ].join(" | ");
 
-    const channelId = process.env.TEAMSPEAK_CHANNEL_ID || "1";
-    await this.teamSpeak.sendMessageToChannel(channelId, message);
+    await this.teamSpeak.sendMessageToChannel(process.env.TEAMSPEAK_CHANNEL_ID || "1", message);
   }
 
   private async createWebhookData(
@@ -695,24 +687,33 @@ export class Calls911Controller {
     locale?: string | null,
   ): Promise<{ embeds: APIEmbed[] }> {
     const t = await getTranslator({ type: "webhooks", locale, namespace: "Calls" });
-    const formattedDescription = slateDataToString(call.descriptionData as Descendant[] | null);
-
-    const caller = call.name || t("unknown");
-    const location = `${call.location} ${call.postal ? call.postal : ""}`;
-    const description = call.description || formattedDescription || t("couldNotRenderDescription");
+    const description = call.descriptionData 
+      ? slateDataToString(call.descriptionData) 
+      : call.description || t("noDescription");
 
     return {
-      embeds: [
-        {
-          title: t("callCreated"),
-          description,
-          footer: { text: t("viewMoreInfo") },
-          fields: [
-            { name: t("location"), value: location, inline: true },
-            { name: t("caller"), value: caller, inline: true },
-          ],
-        },
-      ],
+      embeds: [{
+        title: t("callCreated"),
+        description,
+        fields: [
+          { name: t("caller"), value: call.name || t("unknown"), inline: true },
+          { name: t("location"), value: `${call.location}${call.postal ? ` (${call.postal})` : ""}`, inline: true },
+          { name: "Priority", value: `${call.priority || 3}${call.priorityReason ? ` (${call.priorityReason})` : ""}`, inline: true },
+        ],
+        color: this.getPriorityColor(call.priority),
+        timestamp: new Date().toISOString(),
+      }]
     };
+  }
+
+  private getPriorityColor(priority?: number): number {
+    switch (priority) {
+      case 1: return 0xff0000; // Red - Emergency
+      case 2: return 0xff4500; // OrangeRed - High
+      case 3: return 0xffa500; // Orange - Medium
+      case 4: return 0xffff00; // Yellow - Low
+      case 5: return 0x00ff00; // Green - Info
+      default: return 0x3498db; // Blue - Unknown
+    }
   }
 }

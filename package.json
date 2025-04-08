@@ -34,14 +34,15 @@
   },
   "dependencies": {
     "@faker-js/faker": "^8.4.1",
+    "@google/generative-ai": "^0.24.0",
     "colorette": "2.0.20",
     "concurrently": "^8.2.2",
     "copy": "^0.3.2",
     "dotenv": "^16.4.5",
     "husky": "^8.0.3",
     "prettier": "3.3.1",
-    "turbo": "2.0.3",
-    "ts3-nodejs-library": "^3.5.1"
+    "ts3-nodejs-library": "^3.5.1",
+    "turbo": "2.0.3"
   },
   "pnpm": {
     "overrides": {
